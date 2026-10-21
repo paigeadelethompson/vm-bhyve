@@ -205,6 +205,7 @@ Host and Infrastructure Management
   init          Initialize the host; should be run after each reboot
   switch        Manage virtual network switches
   datastore     Manage datastores
+  iscsi         Manage iSCSI sessions and guest disks
   get           Get all or specified global vm-bhyve configuration(s)
   set           Set global vm-bhyve configuration(s)
   passthru      List all passthru devices and their device IDs

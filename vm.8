@@ -1,7 +1,7 @@
 .\" SPDX-License-Identifier: BSD-2-Clause
 .\" SPDX-FileCopyrightText: 2016 Matt Churchyard <churchers@gmail.com>
 .\" SPDX-FileCopyrightText: 2025 Koichiro Iwao (metalefty) <meta@FreeBSD.org>
-.Dd September 1, 2025
+.Dd October 21, 2026
 .Dt VM-BHYVE 8
 .Os
 .Sh NAME
@@ -81,6 +81,45 @@
 .Nm
 .Cm datastore iso
 .Ar name path
+.Pp
+.Nm
+.Cm iscsi list
+.Op Fl v
+.Nm
+.Cm iscsi discover
+.Op Fl u Ar user
+.Op Fl s Ar secret
+.Op Fl r
+.Op Fl e Ar on|off
+.Ar portal
+.Nm
+.Cm iscsi add
+.Fl n Ar nickname
+.Op Fl c Ar config
+.Op Fl w Ar seconds
+.Nm
+.Cm iscsi add
+.Fl t Ar target
+.Fl p Ar portal
+.Op Fl u Ar user
+.Op Fl s Ar secret
+.Op Fl r
+.Op Fl e Ar on|off
+.Op Fl w Ar seconds
+.Op Fl g Ar guest
+.Op Fl N
+.Nm
+.Cm iscsi remove
+.Op Fl afN
+.Op Ar nickname|target Ns Op / Ns Ar lun
+.Nm
+.Cm iscsi attach
+.Op Fl t Ar emulation
+.Ar guest target Ns Op / Ns Ar lun
+.Nm
+.Cm iscsi detach
+.Op Fl f
+.Ar guest target Ns Op / Ns Ar lun
 .Pp
 .Nm
 .Cm create
@@ -772,6 +811,116 @@ Adds a new datastore location for storing iso files.
 Guests cannot be created in an iso store, but this provides an easy way to
 configure vm-bhyve to look in any arbitrary location on your system (or mounted
 network share) where you may want to store iso images.
+.It Cm iscsi list Op Fl v
+List active iSCSI sessions and targets saved in vm-bhyve's configuration.
+Sessions that are not currently connected are shown in the
+.Sy Configured
+state.
+For each target the associated guest disk names are also shown.
+.Pp
+With
+.Fl v ,
+the output additionally includes the session ID, whether the target is
+persisted, and the underlying device nodes.
+.It Cm iscsi discover Op Ar options Ar portal
+Send a discovery request to the specified portal using
+.Xr iscsictl 8
+.Fl A Fl d .
+The optional
+.Fl u
+and
+.Fl s
+arguments specify a CHAP username and secret.
+.Fl r
+selects iSER instead of TCP, and
+.Fl e Ar on|off
+sets the initial session state.
+Discovery does not create a persistent configuration.
+.It Cm iscsi add Fl n Ar nickname Op Fl c Ar config
+Connect to a session defined in the system
+.Pa /etc/iscsi.conf
+using
+.Xr iscsictl 8
+.Fl A Fl n .
+The
+.Fl c
+option can be used to read an alternative configuration file.
+This form does not create a vm-bhyve configuration entry.
+.It Cm iscsi add Fl t Ar target Fl p Ar portal Op Ar options
+Connect to the specified target and, unless
+.Fl N
+is given, save the target in
+.Pa $vm_dir/.config/iscsi.conf .
+A stable nickname is generated for the target and portal, and subsequent
+connections use this file with
+.Xr iscsictl 8
+.Fl A Fl n .
+The system
+.Pa /etc/iscsi.conf
+is never modified.
+.Pp
+The
+.Fl u
+and
+.Fl s
+options provide CHAP credentials,
+.Fl r
+selects iSER,
+.Fl e Ar on|off
+sets the initial session state, and
+.Fl w Ar seconds
+sets the connection timeout (default 10, zero disables it).
+If
+.Fl g Ar guest
+is specified, the target is attached to the guest as a new disk after it has
+connected.
+.Pp
+Targets saved in this way are reconnected automatically when a guest using
+them is started, including when using
+.Cm startall .
+The
+.Xr iscsid 8
+service and a working
+.Xr iscsictl 8
+are required; vm-bhyve does not start or enable them.
+.It Cm iscsi remove Op Fl afN Op Ar nickname|target Ns Op / Ns Ar lun
+Disconnect an iSCSI session and remove its vm-bhyve configuration entry.
+The session may be specified by its nickname or by a target name, optionally
+with a LUN suffix.
+Because a target name can match more than one session, a portal may be
+supplied after the target.
+.Pp
+.Fl a
+removes all sessions.
+.Fl N
+does not modify the vm-bhyve configuration.
+.Fl f
+skips the confirmation prompt and allows removal of targets that are
+attached to a guest.
+.It Cm iscsi attach Op Fl t Ar emulation Ar guest target Ns Op / Ns Ar lun
+Resolve a connected iSCSI target/LUN and add it to the guest configuration as
+a new disk.
+The target must already be connected.
+The optional
+.Fl t
+argument sets the disk emulation and defaults to the emulation of the last
+configured disk, or
+.Sy virtio-blk .
+The LUN defaults to zero.
+.Pp
+If the guest is running, the new disk is visible after the guest is restarted.
+.It Cm iscsi detach Op Fl f Ar guest target Ns Op / Ns Ar lun
+Remove an iSCSI disk from the guest configuration.
+The disk must match the target and LUN exactly.
+Higher-numbered disks are renumbered so that the disk numbering remains
+contiguous.
+Detaching the boot disk requires
+.Fl f .
+.Pp
+Detaching a disk does not disconnect the iSCSI session.
+Use
+.Cm iscsi remove
+for that.
 .It Xo
 .Cm create
 .Op Fl d Ar datastore
@@ -1672,11 +1821,18 @@ To use a disk image that is stored anywhere else, you can specify the full path
 in this option, and configure the device as
 .Sy custom .
 .Pp
-To use an established iscsi device, specify a target 'session[/lun]'
-(default /0) which matches a unique session from the
-.Pf ' Xr iscsictl 8
--L' command output, and configure the device as
-.Sy iscsi .
+To use an iSCSI device, set
+.Sy diskX_dev
+to
+.Sy iscsi
+and specify a target name with an optional LUN suffix
+.Pq default /0
+in
+.Sy diskX_name .
+The target must be connected when the guest is started.
+The
+.Cm iscsi attach
+subcommand can be used to configure this automatically.
 .It disk0_dev
 The type of device to use for the disk.
 If not specified, this will default to
@@ -1700,12 +1856,17 @@ the
 .Pa diskX_name
 parameter must be set to the full path to the image file or device.
 .Pp
-Already attached iscsi devices can have their device nodes dynamically
+Already attached iSCSI devices can have their device nodes dynamically
 detected and used by setting this option to
 .Sy iscsi
 and
 .Pa diskX_name
 as described above.
+Targets added with
+.Cm iscsi add
+are recorded in
+.Pa $vm_dir/.config/iscsi.conf
+and are connected automatically before the guest starts.
 .It disk0_opts
 Any additional options to use for this disk device.
 Multiple options can be specified, separated by a comma.
@@ -2019,6 +2180,8 @@ Limit guest disk write iops to the specified number of operations per second.
 .Xr vlan 4 ,
 .Xr bhyve 8 ,
 .Xr bhyveload 8 ,
+.Xr iscsictl 8 ,
+.Xr iscsid 8 ,
 .Xr rctl 8 ,
 .Xr zfs 8
 .\" ============ BUGS =============

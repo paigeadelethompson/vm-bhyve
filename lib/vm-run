@@ -974,18 +974,24 @@ vm::bhyve_device_passthru(){
 # @param string _name the name of the guest
 # @param string _disk the name of the disk
 # @param string _disk_dev=file|zvol|sparse-zvol|custom type of device
+# @param string _soft if set, don't fail when an iSCSI disk is unavailable
 #
 vm::get_disk_path(){
     local _var="$1"
     local _name="$2"
     local _disk="$3"
     local _disk_dev="$4"
+    local _soft="$5"
 
     case "${_disk_dev}" in
         zvol)        ;&
         sparse-zvol) setvar "${_var}" "/dev/zvol/${VM_DS_ZFS_DATASET}/${_name}/${_disk}" ;;
         custom|9p)   setvar "${_var}" "${_disk}" ;;
-        iscsi)       info::__find_iscsi "${_var}" "${_disk}" ;;
+        iscsi)       if [ -n "${_soft}" ]; then
+                         iscsi::find_device "${_var}" "${_disk}" "soft"
+                     else
+                         iscsi::find_device "${_var}" "${_disk}"
+                     fi ;;
         *)           setvar "${_var}" "${VM_DS_PATH}/${_name}/${_disk}" ;;
     esac
 }

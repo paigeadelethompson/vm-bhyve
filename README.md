@@ -349,6 +349,41 @@ Please note, for Windows guests the type will need to be `ahci-hd`, as it does n
 
 Restart your vm.
 
+## Using iSCSI storage
+
+vm-bhyve can attach iSCSI LUNs to guests as disks. The host must have a working
+`iscsictl` and the `iscsid` service must be running. vm-bhyve does not start or
+enable `iscsid`; configure it using the normal FreeBSD service mechanism.
+
+Discover targets on a portal:
+
+    # vm iscsi discover 10.0.0.10
+
+Connect to a target, save it in vm-bhyve's configuration, and attach it to a
+guest:
+
+    # vm iscsi add -t iqn.2026-01.example:storage -p 10.0.0.10 -g yourvm
+
+List sessions and the guests using them:
+
+    # vm iscsi list -v
+
+The target can also be configured manually. Set `disk1_dev="iscsi"` and use
+`target[/lun]` as the disk name:
+
+    disk1_name="iqn.2026-01.example:storage/0"
+    disk1_type="virtio-blk"
+    disk1_dev="iscsi"
+
+Targets added with `vm iscsi add` are stored in
+`$vm_dir/.config/iscsi.conf` and are reconnected automatically when a guest
+using them is started, including through `vm startall`. The system
+`/etc/iscsi.conf` is never modified.
+
+Remove a disk from a guest configuration with `vm iscsi detach`, and disconnect
+the session with `vm iscsi remove`. Use `vm iscsi remove -a` to disconnect all
+sessions. See `man vm` for all options.
+
 ## Windows Support
 
 Please see the Windows section in the [Wiki](https://github.com/freebsd/vm-bhyve/wiki/Running-Windows)

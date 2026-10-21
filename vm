@@ -18,6 +18,7 @@ fi
 . "${LIB}/vm-guest"
 . "${LIB}/vm-help"
 . "${LIB}/vm-info"
+. "${LIB}/vm-iscsi"
 . "${LIB}/vm-migration"
 . "${LIB}/vm-rctl"
 . "${LIB}/vm-run"

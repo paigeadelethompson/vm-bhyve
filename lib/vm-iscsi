@@ -1,0 +1,1190 @@
+#!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+
+iscsi::__config_file(){
+    printf '%s\n' "${vm_dir}/.config/iscsi.conf"
+}
+
+iscsi::__check(){
+    local _out
+
+    ISCSI_ERROR=""
+    if ! command -v iscsictl >/dev/null 2>&1; then
+        ISCSI_ERROR="iscsictl is required to manage iSCSI"
+        return 1
+    fi
+
+    _out=$(iscsictl -L 2>&1)
+    if [ $? -ne 0 ]; then
+        ISCSI_ERROR="iscsictl -L failed: ${_out}"
+        return 1
+    fi
+
+    return 0
+}
+
+iscsi::__require(){
+    iscsi::__check || util::err "${ISCSI_ERROR}"
+}
+
+iscsi::__live_lines(){
+    iscsictl -L 2>/dev/null | awk 'NR == 1 && $1 == "Target" && $2 == "name" { next } NF { print }'
+}
+
+iscsi::__parse_spec(){
+    local _spec="$1"
+    local _var_target="$2"
+    local _var_lun="$3"
+    local __pt __pl=0
+
+    ISCSI_ERROR=""
+
+    if [ -z "${_spec}" ]; then
+        ISCSI_ERROR="iSCSI disk name is empty"
+        return 1
+    fi
+
+    __pt="${_spec}"
+    case "${_spec}" in
+        */*)
+            __pl="${_spec##*/}"
+            case "${__pl}" in
+                ''|*[!0-9]*)
+                    ISCSI_ERROR="invalid iSCSI lun in '${_spec}'"
+                    return 1
+                    ;;
+                *)
+                    __pt="${_spec%/*}"
+                    ;;
+            esac
+            ;;
+    esac
+
+    if [ -z "${__pt}" ]; then
+        ISCSI_ERROR="invalid iSCSI target '${_spec}'"
+        return 1
+    fi
+
+    setvar "${_var_target}" "${__pt}"
+    setvar "${_var_lun}" "${__pl}"
+}
+
+iscsi::__lookup(){
+    local _target="$1"
+    local _portal="$2"
+    local _all _exact _matches _count _line
+
+    ISCSI_TARGET=""
+    ISCSI_PORTAL=""
+    ISCSI_STATE=""
+    ISCSI_LINE=""
+    ISCSI_ERROR=""
+
+    _all=$(iscsi::__live_lines)
+
+    if [ -n "${_portal}" ]; then
+        _exact=$(printf '%s\n' "${_all}" | awk -v t="${_target}" -v p="${_portal}" '$1 == t && ($2 == p || $2 == p ":3260")')
+    else
+        _exact=$(printf '%s\n' "${_all}" | awk -v t="${_target}" '$1 == t')
+    fi
+
+    if [ -n "${_exact}" ]; then
+        _matches="${_exact}"
+    elif [ -n "${_portal}" ]; then
+        _matches=$(printf '%s\n' "${_all}" | awk -v t="${_target}" -v p="${_portal}" 'index($1, t) > 0 && ($2 == p || $2 == p ":3260")')
+    else
+        _matches=$(printf '%s\n' "${_all}" | awk -v t="${_target}" 'index($1, t) > 0')
+    fi
+
+    _count=$(printf '%s\n' "${_matches}" | awk 'NF { n++ } END { print n + 0 }')
+    if [ "${_count}" -eq 0 ]; then
+        ISCSI_ERROR="iSCSI target '${_target}' is not attached"
+        return 1
+    elif [ "${_count}" -gt 1 ]; then
+        ISCSI_ERROR="iSCSI target '${_target}' is ambiguous; matches ${_count} sessions"
+        return 1
+    fi
+
+    _line="${_matches}"
+    ISCSI_LINE="${_line}"
+    ISCSI_TARGET=$(printf '%s\n' "${_line}" | awk '{ print $1 }')
+    ISCSI_PORTAL=$(printf '%s\n' "${_line}" | awk '{ print $2 }')
+    ISCSI_STATE=$(printf '%s\n' "${_line}" | awk '{ $1 = ""; $2 = ""; sub(/^[ \t]+/, ""); print }')
+}
+
+iscsi::__session_id(){
+    local _target="$1"
+    local _portal="$2"
+
+    iscsictl -L -v 2>/dev/null | awk -v t="${_target}" -v p="${_portal}" '
+        /^Session ID:/ {
+            sid = $0
+            sub(/^Session ID:[[:space:]]*/, "", sid)
+        }
+        /^Target name:/ {
+            name = $0
+            sub(/^Target name:[[:space:]]*/, "", name)
+        }
+        /^Target portal:/ {
+            portal = $0
+            sub(/^Target portal:[[:space:]]*/, "", portal)
+            if (name == t && (p == "" || portal == p || portal == p ":3260")) {
+                print sid
+                exit
+            }
+        }'
+}
+
+iscsi::__persisted_lines(){
+    local _file
+
+    _file=$(iscsi::__config_file)
+    [ -f "${_file}" ] || return 0
+
+    awk '
+        /^# BEGIN vm-bhyve iscsi / {
+            nick = $NF
+            target = ""
+            portal = ""
+        }
+        /^# vm-bhyve-target: / {
+            target = $0
+            sub(/^# vm-bhyve-target: /, "", target)
+        }
+        /^# vm-bhyve-portal: / {
+            portal = $0
+            sub(/^# vm-bhyve-portal: /, "", portal)
+        }
+        /^# END vm-bhyve iscsi / {
+            if (nick != "") {
+                printf "%s\t%s\t%s\n", nick, target, portal
+            }
+            nick = ""
+        }' "${_file}"
+}
+
+iscsi::__persisted_lookup(){
+    local _target="$1"
+    local _portal="$2"
+    local _lines _exact _matches _count _line
+
+    ISCSI_CONFIG_NICK=""
+    ISCSI_CONFIG_TARGET=""
+    ISCSI_CONFIG_PORTAL=""
+    ISCSI_ERROR=""
+
+    _lines=$(iscsi::__persisted_lines)
+    if [ -z "${_lines}" ]; then
+        ISCSI_ERROR="no vm-bhyve iSCSI configuration"
+        return 1
+    fi
+
+    if [ -n "${_portal}" ]; then
+        _exact=$(printf '%s\n' "${_lines}" | awk -F '\t' -v t="${_target}" -v p="${_portal}" '$2 == t && ($3 == p || $3 == p ":3260")')
+    else
+        _exact=$(printf '%s\n' "${_lines}" | awk -F '\t' -v t="${_target}" '$2 == t')
+    fi
+
+    if [ -n "${_exact}" ]; then
+        _matches="${_exact}"
+    elif [ -n "${_portal}" ]; then
+        _matches=$(printf '%s\n' "${_lines}" | awk -F '\t' -v t="${_target}" -v p="${_portal}" 'index($2, t) > 0 && ($3 == p || $3 == p ":3260")')
+    else
+        _matches=$(printf '%s\n' "${_lines}" | awk -F '\t' -v t="${_target}" 'index($2, t) > 0')
+    fi
+
+    _count=$(printf '%s\n' "${_matches}" | awk 'NF { n++ } END { print n + 0 }')
+    if [ "${_count}" -eq 0 ]; then
+        ISCSI_ERROR="no persistent iSCSI configuration for '${_target}'"
+        return 1
+    elif [ "${_count}" -gt 1 ]; then
+        ISCSI_ERROR="persistent iSCSI configuration for '${_target}' is ambiguous"
+        return 1
+    fi
+
+    _line="${_matches}"
+    ISCSI_CONFIG_NICK=$(printf '%s\n' "${_line}" | awk -F '\t' '{ print $1 }')
+    ISCSI_CONFIG_TARGET=$(printf '%s\n' "${_line}" | awk -F '\t' '{ print $2 }')
+    ISCSI_CONFIG_PORTAL=$(printf '%s\n' "${_line}" | awk -F '\t' '{ print $3 }')
+}
+
+iscsi::__is_persisted(){
+    iscsi::__persisted_lookup "$1" "$2" >/dev/null 2>&1
+}
+
+iscsi::__validate_value(){
+    local _value="$1"
+    local _name="$2"
+
+    case "${_value}" in
+        *'"'*)
+            ISCSI_ERROR="${_name} cannot contain a double quote"
+            return 1
+            ;;
+    esac
+
+    if [ "$(printf '%s' "${_value}" | wc -l | tr -d ' ')" -ne 0 ]; then
+        ISCSI_ERROR="${_name} cannot contain a newline"
+        return 1
+    fi
+}
+
+iscsi::__nickname(){
+    local _hash
+
+    if command -v md5 >/dev/null 2>&1; then
+        _hash=$(printf '%s\n%s\n' "$1" "$2" | md5 -q)
+    else
+        _hash=$(printf '%s\n%s\n' "$1" "$2" | cksum | awk '{ print $1 }')
+    fi
+
+    printf 'vm_%s\n' "$(printf '%s' "${_hash}" | cut -c1-16)"
+}
+
+iscsi::__save_stanza(){
+    local _target="$1"
+    local _portal="$2"
+    local _nick="$3"
+    local _user="$4"
+    local _secret="$5"
+    local _protocol="$6"
+    local _enable="$7"
+    local _file _tmp
+
+    _file=$(iscsi::__config_file)
+    mkdir -p "${vm_dir}/.config" || util::err "unable to create ${vm_dir}/.config"
+    _tmp=$(mktemp "${_file}.XXXXXX") || util::err "unable to create temporary iSCSI configuration"
+
+    if [ -f "${_file}" ]; then
+        awk -v n="${_nick}" '
+            $0 == "# BEGIN vm-bhyve iscsi " n { skip = 1; next }
+            skip && $0 == "# END vm-bhyve iscsi " n { skip = 0; next }
+            !skip { print }
+        ' "${_file}" > "${_tmp}"
+
+        if [ $? -ne 0 ]; then
+            rm -f "${_tmp}"
+            util::err "unable to read ${_file}"
+        fi
+    fi
+
+    {
+        printf '# BEGIN vm-bhyve iscsi %s\n' "${_nick}"
+        printf '# vm-bhyve-target: %s\n' "${_target}"
+        printf '# vm-bhyve-portal: %s\n' "${_portal}"
+        printf '%s {\n' "${_nick}"
+        printf '    TargetName = "%s";\n' "${_target}"
+        printf '    TargetAddress = "%s";\n' "${_portal}"
+        if [ -n "${_user}" ]; then
+            printf '    AuthMethod = CHAP;\n'
+            printf '    chapIName = "%s";\n' "${_user}"
+            printf '    chapSecret = "%s";\n' "${_secret}"
+        fi
+        if [ "${_protocol}" = "iser" ]; then
+            printf '    protocol = iSER;\n'
+        fi
+        if [ "${_enable}" = "off" ]; then
+            printf '    Enable = Off;\n'
+        fi
+        printf '}\n'
+        printf '# END vm-bhyve iscsi %s\n' "${_nick}"
+    } >> "${_tmp}"
+
+    chmod 600 "${_tmp}"
+    mv "${_tmp}" "${_file}" || {
+        rm -f "${_tmp}"
+        util::err "unable to update ${_file}"
+    }
+}
+
+iscsi::__delete_stanza(){
+    local _nick="$1"
+    local _file _tmp
+
+    _file=$(iscsi::__config_file)
+    [ -f "${_file}" ] || return 0
+
+    _tmp=$(mktemp "${_file}.XXXXXX") || util::err "unable to create temporary iSCSI configuration"
+    awk -v n="${_nick}" '
+        $0 == "# BEGIN vm-bhyve iscsi " n { skip = 1; next }
+        skip && $0 == "# END vm-bhyve iscsi " n { skip = 0; next }
+        !skip { print }
+    ' "${_file}" > "${_tmp}"
+
+    if [ $? -ne 0 ]; then
+        rm -f "${_tmp}"
+        util::err "unable to read ${_file}"
+    fi
+
+    chmod 600 "${_tmp}"
+    mv "${_tmp}" "${_file}" || {
+        rm -f "${_tmp}"
+        util::err "unable to update ${_file}"
+    }
+}
+
+iscsi::__delete_all_stanzas(){
+    rm -f "$(iscsi::__config_file)"
+}
+
+iscsi::__guest_scan(){
+    local _target="$1"
+    local _show_spec="$2"
+    local _ds _dir _name _num _disk _dev _gt _gl
+
+    for _ds in ${VM_DATASTORE_LIST}; do
+        datastore::get "${_ds}" || continue
+
+        for _dir in "${VM_DS_PATH}"/*; do
+            [ -d "${_dir}" ] || continue
+
+            _name="${_dir##*/}"
+            [ -f "${_dir}/${_name}.conf" ] || continue
+
+            config::load "${_dir}/${_name}.conf"
+            _num=0
+
+            while true; do
+                config::get "_disk" "disk${_num}_name"
+                [ -z "${_disk}" ] && break
+
+                config::get "_dev" "disk${_num}_dev" "file"
+                if [ "${_dev}" = "iscsi" ]; then
+                    if [ -z "${_target}" ]; then
+                        if [ -n "${_show_spec}" ]; then
+                            printf '%s/disk%s (%s)\n' "${_name}" "${_num}" "${_disk}"
+                        else
+                            printf '%s/disk%s\n' "${_name}" "${_num}"
+                        fi
+                    elif iscsi::__parse_spec "${_disk}" "_gt" "_gl" >/dev/null 2>&1; then
+                        if [ "${_gt}" = "${_target}" ] || [ "${_target#*"${_gt}"}" != "${_target}" ]; then
+                            printf '%s/disk%s\n' "${_name}" "${_num}"
+                        fi
+                    fi
+                fi
+
+                _num=$((_num + 1))
+            done
+        done
+    done
+}
+
+iscsi::__guests_using(){
+    iscsi::__guest_scan "$1" ""
+}
+
+iscsi::__all_iscsi_guests(){
+    iscsi::__guest_scan "" "1"
+}
+
+iscsi::__device_for(){
+    local _target="$1"
+    local _lun="$2"
+    local _sid _verbose _cam _device _devices _cam_ok
+
+    ISCSI_DEVICE=""
+    ISCSI_ERROR=""
+
+    _verbose=$(iscsictl -L -v 2>&1)
+    if [ $? -ne 0 ]; then
+        ISCSI_ERROR="iscsictl -L -v failed: ${_verbose}"
+        return 1
+    fi
+
+    _sid=$(printf '%s\n' "${_verbose}" | awk -v t="${_target}" '
+        /^Session ID:/ {
+            sid = $0
+            sub(/^Session ID:[[:space:]]*/, "", sid)
+        }
+        /^Target name:/ {
+            name = $0
+            sub(/^Target name:[[:space:]]*/, "", name)
+            if (name == t) {
+                print sid
+                exit
+            }
+        }')
+
+    _devices=$(printf '%s\n' "${_verbose}" | awk -v t="${_target}" '
+        /^Target name:/ {
+            name = $0
+            sub(/^Target name:[[:space:]]*/, "", name)
+            inblock = (name == t)
+        }
+        inblock && /^Device nodes:/ {
+            line = $0
+            sub(/^Device nodes:[[:space:]]*/, "", line)
+            print line
+            exit
+        }')
+
+    if [ -z "${_target}" ]; then
+        ISCSI_ERROR="iSCSI target is empty"
+        return 1
+    fi
+
+    if [ -z "${_devices}" ]; then
+        ISCSI_ERROR="iSCSI target '${_target}' is not connected"
+        return 1
+    fi
+
+    if [ -z "${_sid}" ]; then
+        ISCSI_ERROR="unable to find iSCSI session for '${_target}'"
+        return 1
+    fi
+
+    if command -v camcontrol >/dev/null 2>&1; then
+        _cam=$(camcontrol devlist -v 2>/dev/null)
+        if [ $? -eq 0 ]; then
+            _cam_ok=1
+            _device=$(printf '%s\n' "${_cam}" | awk -v sid="${_sid}" -v lun="${_lun}" '
+                /^scbus[0-9]+ on iscsi[0-9]+ / {
+                    bus = $1
+                    sub(/:$/, "", bus)
+                    sess = $3
+                    sub(/^iscsi/, "", sess)
+                    if (sess == sid) {
+                        isbus[bus] = 1
+                    }
+                    next
+                }
+                / at scbus[0-9]+ / {
+                    line = $0
+                    sub(/^.* at /, "", line)
+                    split(line, f)
+                    if (!(f[1] in isbus)) {
+                        next
+                    }
+                    if (f[2] != "target" || f[4] != "lun" || f[5] != lun) {
+                        next
+                    }
+                    devs = f[6]
+                    gsub(/^\(/, "", devs)
+                    gsub(/\)$/, "", devs)
+                    split(devs, d, ",")
+                    for (i = 1; i in d; i++) {
+                        gsub(/^[[:space:]]+/, "", d[i])
+                        gsub(/[[:space:]]+$/, "", d[i])
+                        if (d[i] ~ /^da[0-9]+$/) {
+                            print d[i]
+                            exit
+                        }
+                    }
+                }')
+        fi
+    fi
+
+    if [ -z "${_device}" ] && [ "${_lun}" -eq 0 ] && [ -z "${_cam_ok}" ]; then
+        case "${_devices}" in
+            *' '*) ;;
+            *) _device="${_devices}" ;;
+        esac
+    fi
+
+    if [ -z "${_device}" ]; then
+        if [ "${_lun}" -ne 0 ] && ! command -v camcontrol >/dev/null 2>&1; then
+            ISCSI_ERROR="camcontrol is required to resolve iSCSI lun ${_lun} for '${_target}'"
+        else
+            ISCSI_ERROR="unable to locate iSCSI device for '${_target}/${_lun}' (devices: ${_devices})"
+        fi
+        return 1
+    fi
+
+    if [ ! -c "/dev/${_device}" ]; then
+        ISCSI_ERROR="iSCSI device /dev/${_device} for '${_target}/${_lun}' is not available"
+        return 1
+    fi
+
+    ISCSI_DEVICE="${_device}"
+}
+
+iscsi::find_device(){
+    local _var="$1"
+    local _spec="$2"
+    local _soft="$3"
+    local _target _lun
+
+    setvar "${_var}" ""
+
+    if ! iscsi::__parse_spec "${_spec}" "_target" "_lun"; then
+        if [ "${_soft}" = "soft" ]; then
+            util::warn "${ISCSI_ERROR}"
+            return 1
+        fi
+        util::err "${ISCSI_ERROR}"
+    fi
+
+    if ! iscsi::__check; then
+        if [ "${_soft}" = "soft" ]; then
+            util::warn "${ISCSI_ERROR}"
+            return 1
+        fi
+        util::err "${ISCSI_ERROR}"
+    fi
+
+    if ! iscsi::__lookup "${_target}" ""; then
+        if [ "${_soft}" = "soft" ]; then
+            util::warn "${ISCSI_ERROR}"
+            return 1
+        fi
+        util::err "${ISCSI_ERROR}"
+    fi
+
+    if ! iscsi::__device_for "${ISCSI_TARGET}" "${_lun}"; then
+        if [ "${_soft}" = "soft" ]; then
+            util::warn "${ISCSI_ERROR}"
+            return 1
+        fi
+        util::err "${ISCSI_ERROR}"
+    fi
+
+    setvar "${_var}" "/dev/${ISCSI_DEVICE}"
+}
+
+iscsi::ensure_guest_sessions(){
+    local _name="$1"
+    local _num=0 _disk _dev _target _lun _any=0
+    local _sid _out
+
+    while true; do
+        config::get "_disk" "disk${_num}_name"
+        [ -z "${_disk}" ] && break
+
+        config::get "_dev" "disk${_num}_dev" "file"
+        if [ "${_dev}" = "iscsi" ]; then
+            _any=1
+
+            if ! iscsi::__parse_spec "${_disk}" "_target" "_lun"; then
+                util::warn "guest '${_name}': ${ISCSI_ERROR}"
+                return 1
+            fi
+
+            if ! iscsi::__check; then
+                util::warn "guest '${_name}': ${ISCSI_ERROR}"
+                return 1
+            fi
+
+            if iscsi::__lookup "${_target}" ""; then
+                case "${ISCSI_STATE}" in
+                    Connected*) continue ;;
+                esac
+
+                _sid=$(iscsi::__session_id "${ISCSI_TARGET}" "${ISCSI_PORTAL}")
+                if [ -n "${_sid}" ]; then
+                    iscsictl -M -i "${_sid}" -e on >/dev/null 2>&1
+                    iscsictl -L -w 10 >/dev/null 2>&1
+                fi
+
+                if iscsi::__lookup "${_target}" ""; then
+                    case "${ISCSI_STATE}" in
+                        Connected*) continue ;;
+                    esac
+                fi
+
+                util::warn "iSCSI target '${_target}' is not connected (${ISCSI_STATE})"
+                return 1
+            else
+                case "${ISCSI_ERROR}" in
+                    *ambiguous*)
+                        util::warn "guest '${_name}': ${ISCSI_ERROR}"
+                        return 1
+                        ;;
+                esac
+            fi
+
+            if iscsi::__persisted_lookup "${_target}" ""; then
+                echo "  * connecting iSCSI target ${ISCSI_CONFIG_TARGET}"
+
+                if ! _out=$(iscsictl -A -n "${ISCSI_CONFIG_NICK}" -c "$(iscsi::__config_file)" -w 10 2>&1); then
+                    util::warn "unable to connect iSCSI target '${ISCSI_CONFIG_TARGET}': ${_out}"
+                    return 1
+                fi
+            else
+                util::warn "guest '${_name}': ${ISCSI_ERROR}"
+                return 1
+            fi
+        fi
+
+        _num=$((_num + 1))
+    done
+
+    [ "${_any}" -eq 0 ] && return 0
+
+    _num=0
+    while true; do
+        config::get "_disk" "disk${_num}_name"
+        [ -z "${_disk}" ] && break
+
+        config::get "_dev" "disk${_num}_dev" "file"
+        if [ "${_dev}" = "iscsi" ]; then
+            if ! iscsi::__parse_spec "${_disk}" "_target" "_lun"; then
+                util::warn "guest '${_name}': ${ISCSI_ERROR}"
+                return 1
+            fi
+
+            if ! iscsi::__lookup "${_target}" ""; then
+                util::warn "guest '${_name}': ${ISCSI_ERROR}"
+                return 1
+            fi
+
+            if ! iscsi::__device_for "${ISCSI_TARGET}" "${_lun}"; then
+                util::warn "guest '${_name}': ${ISCSI_ERROR}"
+                return 1
+            fi
+        fi
+
+        _num=$((_num + 1))
+    done
+
+    return 0
+}
+
+iscsi::list(){
+    local _verbose _opt
+    local _all _line _target _portal _state _devices _guests _id _persist
+    local _pl _nick _ptarget _pportal
+
+    OPTIND=1
+    while getopts v _opt; do
+        case "${_opt}" in
+            v) _verbose="1" ;;
+            *) help::show "iscsi" ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+
+    iscsi::__require
+    _all=$(iscsi::__live_lines)
+
+    {
+        if [ -n "${_verbose}" ]; then
+            printf '%s^%s^%s^%s^%s^%s^%s\n' "ID" "TARGET" "PORTAL" "STATE" "DEVICES" "GUESTS" "PERSIST"
+        else
+            printf '%s^%s^%s^%s^%s\n' "TARGET" "PORTAL" "STATE" "DEVICES" "GUESTS"
+        fi
+
+        printf '%s\n' "${_all}" | while read -r _line; do
+            [ -z "${_line}" ] && continue
+
+            set -- ${_line}
+            _target="$1"
+            _portal="$2"
+            shift 2
+            _state="$*"
+
+            _devices=""
+            case "${_state}" in
+                Connected:*)
+                    _devices="${_state#Connected:}"
+                    _state="Connected"
+                    ;;
+            esac
+            _devices=$(printf '%s' "${_devices}" | sed 's/^ *//;s/ *$//')
+
+            _guests=$(iscsi::__guests_using "${_target}" | tr '\n' ' ' | sed 's/ *$//')
+            [ -z "${_guests}" ] && _guests="-"
+
+            if [ -n "${_verbose}" ]; then
+                _id=$(iscsi::__session_id "${_target}" "${_portal}")
+                [ -z "${_id}" ] && _id="-"
+                _persist="no"
+                if iscsi::__is_persisted "${_target}" "${_portal}"; then
+                    _persist="yes"
+                fi
+                printf '%s^%s^%s^%s^%s^%s^%s\n' "${_id}" "${_target}" "${_portal}" "${_state}" "${_devices:--}" "${_guests}" "${_persist}"
+            else
+                printf '%s^%s^%s^%s^%s\n' "${_target}" "${_portal}" "${_state}" "${_devices:--}" "${_guests}"
+            fi
+        done
+
+        while IFS= read -r _pl; do
+            [ -z "${_pl}" ] && continue
+
+            _nick=$(printf '%s\n' "${_pl}" | awk -F '\t' '{ print $1 }')
+            _ptarget=$(printf '%s\n' "${_pl}" | awk -F '\t' '{ print $2 }')
+            _pportal=$(printf '%s\n' "${_pl}" | awk -F '\t' '{ print $3 }')
+
+            if printf '%s\n' "${_all}" | awk -v t="${_ptarget}" -v p="${_pportal}" '$1 == t && ($2 == p || $2 == p ":3260") { found = 1 } END { exit !found }'; then
+                continue
+            fi
+
+            _guests=$(iscsi::__guests_using "${_ptarget}" | tr '\n' ' ' | sed 's/ *$//')
+            [ -z "${_guests}" ] && _guests="-"
+
+            if [ -n "${_verbose}" ]; then
+                printf '%s^%s^%s^%s^%s^%s^%s\n' "-" "${_ptarget}" "${_pportal}" "Configured" "-" "${_guests}" "yes"
+            else
+                printf '%s^%s^%s^%s^%s\n' "${_ptarget}" "${_pportal}" "Configured" "-" "${_guests}"
+            fi
+        done <<EOF
+$(iscsi::__persisted_lines)
+EOF
+    } | column -ts^
+}
+
+iscsi::discover(){
+    local _user _secret _protocol _enable _opt _host _out
+    local _rc
+
+    OPTIND=1
+    while getopts u:s:re: _opt; do
+        case "${_opt}" in
+            u) _user="${OPTARG}" ;;
+            s) _secret="${OPTARG}" ;;
+            r) _protocol="iser" ;;
+            e) _enable="${OPTARG}" ;;
+            *) help::show "iscsi" ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+
+    _host="$1"
+    [ -z "${_host}" ] && help::show "iscsi"
+    [ -n "$2" ] && util::err "too many arguments"
+
+    if [ -n "${_user}" -a -z "${_secret}" ]; then
+        util::err "-u requires -s"
+    elif [ -z "${_user}" -a -n "${_secret}" ]; then
+        util::err "-s requires -u"
+    fi
+
+    if [ -n "${_enable}" ] && [ "${_enable}" != "on" -a "${_enable}" != "off" ]; then
+        util::err "-e must be either 'on' or 'off'"
+    fi
+
+    iscsi::__require
+
+    set -- iscsictl -A -d "${_host}"
+    [ -n "${_user}" ] && set -- "$@" -u "${_user}" -s "${_secret}"
+    [ "${_protocol}" = "iser" ] && set -- "$@" -r
+    [ -n "${_enable}" ] && set -- "$@" -e "${_enable}"
+
+    _out=$("$@" 2>&1)
+    _rc=$?
+    if [ "${_rc}" -ne 0 ]; then
+        util::err "iscsictl failed: ${_out}"
+    fi
+
+    printf '%s\n' "${_out}"
+    echo "Discovery complete. Use 'vm iscsi add' to connect and persist a target."
+}
+
+iscsi::add(){
+    local _nickname _config _user _secret _protocol _enable _timeout=10 _guest _persist=1
+    local _opt _target="" _portal="" _file _nick _out _rc _sid _full
+    local _already=0
+
+    OPTIND=1
+    while getopts n:c:u:s:t:p:re:w:g:N _opt; do
+        case "${_opt}" in
+            n) _nickname="${OPTARG}" ;;
+            c) _config="${OPTARG}" ;;
+            u) _user="${OPTARG}" ;;
+            s) _secret="${OPTARG}" ;;
+            t) _target="${OPTARG}" ;;
+            p) _portal="${OPTARG}" ;;
+            r) _protocol="iser" ;;
+            e) _enable="${OPTARG}" ;;
+            w) _timeout="${OPTARG}" ;;
+            g) _guest="${OPTARG}" ;;
+            N) _persist="0" ;;
+            *) help::show "iscsi" ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+
+    if [ -z "${_target}" ]; then
+        _target="$1"
+        shift
+    fi
+    if [ -z "${_portal}" ]; then
+        _portal="$1"
+        shift
+    fi
+    [ -n "$1" ] && util::err "too many arguments"
+
+    case "${_timeout}" in
+        ''|*[!0-9]*) util::err "timeout must be a non-negative number" ;;
+    esac
+
+    if [ -n "${_enable}" ] && [ "${_enable}" != "on" -a "${_enable}" != "off" ]; then
+        util::err "-e must be either 'on' or 'off'"
+    fi
+
+    if [ -n "${_user}" -a -z "${_secret}" ]; then
+        util::err "-u requires -s"
+    elif [ -z "${_user}" -a -n "${_secret}" ]; then
+        util::err "-s requires -u"
+    fi
+
+    if [ -n "${_nickname}" ]; then
+        [ -n "${_target}" -o -n "${_portal}" ] && util::err "do not specify a target and portal with -n"
+        [ -n "${_user}" -o -n "${_secret}" -o -n "${_protocol}" -o -n "${_enable}" -o -n "${_guest}" ] && \
+            util::err "-n cannot be combined with -u, -s, -r, -e or -g"
+
+        iscsi::__require
+
+        set -- iscsictl -A -n "${_nickname}"
+        [ -n "${_config}" ] && set -- "$@" -c "${_config}"
+        [ "${_timeout}" -gt 0 ] && set -- "$@" -w "${_timeout}"
+
+        _out=$("$@" 2>&1)
+        _rc=$?
+        if [ "${_rc}" -ne 0 ]; then
+            util::err "iscsictl failed: ${_out}"
+        fi
+
+        echo "Connected iSCSI session ${_nickname}"
+        return 0
+    fi
+
+    if [ -z "${_target}" -o -z "${_portal}" ]; then
+        help::show "iscsi"
+    fi
+
+    if ! iscsi::__validate_value "${_target}" "target"; then
+        util::err "${ISCSI_ERROR}"
+    fi
+    if ! iscsi::__validate_value "${_portal}" "portal"; then
+        util::err "${ISCSI_ERROR}"
+    fi
+    if [ -n "${_user}" ] && ! iscsi::__validate_value "${_user}" "user"; then
+        util::err "${ISCSI_ERROR}"
+    fi
+    if [ -n "${_secret}" ] && ! iscsi::__validate_value "${_secret}" "secret"; then
+        util::err "${ISCSI_ERROR}"
+    fi
+
+    iscsi::__require
+
+    _file=$(iscsi::__config_file)
+    _nick=$(iscsi::__nickname "${_target}" "${_portal}")
+
+    if iscsi::__lookup "${_target}" "${_portal}"; then
+        _already=1
+        _sid=$(iscsi::__session_id "${ISCSI_TARGET}" "${ISCSI_PORTAL}")
+    else
+        case "${ISCSI_ERROR}" in
+            *ambiguous*) util::err "${ISCSI_ERROR}" ;;
+        esac
+    fi
+
+    if [ "${_persist}" -eq 1 ]; then
+        iscsi::__save_stanza "${_target}" "${_portal}" "${_nick}" "${_user}" "${_secret}" "${_protocol}" "${_enable}"
+    fi
+
+    if [ "${_already}" -eq 1 ]; then
+        case "${ISCSI_STATE}" in
+            Connected*)
+                if [ "${_persist}" -eq 1 ]; then
+                    echo "iSCSI session already connected; configuration saved in ${_file}"
+                else
+                    echo "iSCSI session already connected"
+                fi
+                ;;
+            *)
+                if [ -n "${_sid}" ]; then
+                    iscsictl -M -i "${_sid}" -e on >/dev/null 2>&1
+                    if [ "${_timeout}" -gt 0 ]; then
+                        iscsictl -L -w "${_timeout}" >/dev/null 2>&1
+                    fi
+                fi
+                ;;
+        esac
+    else
+        if [ "${_persist}" -eq 1 ]; then
+            set -- iscsictl -A -n "${_nick}" -c "${_file}"
+        else
+            set -- iscsictl -A -p "${_portal}" -t "${_target}"
+            [ -n "${_user}" ] && set -- "$@" -u "${_user}" -s "${_secret}"
+            [ "${_protocol}" = "iser" ] && set -- "$@" -r
+            [ -n "${_enable}" ] && set -- "$@" -e "${_enable}"
+        fi
+        [ "${_timeout}" -gt 0 ] && set -- "$@" -w "${_timeout}"
+
+        _out=$("$@" 2>&1)
+        _rc=$?
+        if [ "${_rc}" -ne 0 ]; then
+            if [ "${_persist}" -eq 1 ]; then
+                util::warn "iscsictl failed: ${_out}; configuration saved in ${_file}"
+            else
+                util::err "iscsictl failed: ${_out}"
+            fi
+            return 1
+        fi
+    fi
+
+    if ! iscsi::__lookup "${_target}" "${_portal}"; then
+        util::warn "${ISCSI_ERROR}"
+        return 1
+    fi
+
+    case "${ISCSI_STATE}" in
+        Connected*)
+            _full="${ISCSI_TARGET}/0"
+            echo "Connected iSCSI target ${ISCSI_TARGET} via ${ISCSI_PORTAL}"
+            ;;
+        *)
+            util::warn "iSCSI target '${_target}' is not connected (${ISCSI_STATE})"
+            return 1
+            ;;
+    esac
+
+    if [ -n "${_guest}" ]; then
+        iscsi::attach "${_guest}" "${_full}"
+    fi
+}
+
+iscsi::remove(){
+    local _all _force _persist=1 _opt _target _portal _users _out _rc _nick _found=0
+    local _file
+
+    OPTIND=1
+    while getopts afN _opt; do
+        case "${_opt}" in
+            a) _all="1" ;;
+            f) _force="1" ;;
+            N) _persist="0" ;;
+            *) help::show "iscsi" ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+
+    _target="$1"
+    _portal="$2"
+    [ -n "$3" ] && util::err "too many arguments"
+
+    iscsi::__require
+    _file=$(iscsi::__config_file)
+
+    if [ -n "${_all}" ]; then
+        [ -n "${_target}" -o -n "${_portal}" ] && util::err "do not specify a target with -a"
+
+        _users=$(iscsi::__all_iscsi_guests)
+        if [ -n "${_users}" -a -z "${_force}" ]; then
+            util::err "iSCSI disks are in use: $(printf '%s' "${_users}" | tr '\n' ' '); use -f to remove"
+        fi
+
+        if [ -z "${_force}" ] && ! util::confirm "Remove all iSCSI sessions"; then
+            return 0
+        fi
+
+        _out=$(iscsictl -Ra 2>&1)
+        _rc=$?
+        if [ "${_rc}" -ne 0 ]; then
+            util::err "iscsictl failed: ${_out}"
+        fi
+
+        if [ "${_persist}" -eq 1 ]; then
+            iscsi::__delete_all_stanzas
+        fi
+
+        echo "Removed all iSCSI sessions"
+        return 0
+    fi
+
+    [ -z "${_target}" ] && help::show "iscsi"
+
+    if iscsi::__lookup "${_target}" "${_portal}"; then
+        _found=1
+        _target="${ISCSI_TARGET}"
+        _portal="${ISCSI_PORTAL}"
+    else
+        case "${ISCSI_ERROR}" in
+            *ambiguous*) util::err "${ISCSI_ERROR}" ;;
+        esac
+
+        if [ "${_persist}" -eq 1 ] && iscsi::__persisted_lookup "${_target}" "${_portal}"; then
+            _target="${ISCSI_CONFIG_TARGET}"
+            _portal="${ISCSI_CONFIG_PORTAL}"
+        else
+            util::err "${ISCSI_ERROR}"
+        fi
+    fi
+
+    _users=$(iscsi::__guests_using "${_target}")
+    if [ -n "${_users}" -a -z "${_force}" ]; then
+        util::err "iSCSI target '${_target}' is in use by $(printf '%s' "${_users}" | tr '\n' ' '); use -f to remove"
+    fi
+
+    if [ -z "${_force}" ] && ! util::confirm "Remove iSCSI session ${_target} (${_portal})"; then
+        return 0
+    fi
+
+    if [ "${_found}" -eq 1 ]; then
+        if [ "${_persist}" -eq 1 ] && iscsi::__persisted_lookup "${_target}" "${_portal}"; then
+            _nick="${ISCSI_CONFIG_NICK}"
+            _out=$(iscsictl -R -n "${_nick}" -c "${_file}" 2>&1)
+        else
+            _out=$(iscsictl -R -p "${_portal}" -t "${_target}" 2>&1)
+        fi
+
+        _rc=$?
+        if [ "${_rc}" -ne 0 ]; then
+            util::err "iscsictl failed: ${_out}"
+        fi
+    fi
+
+    if [ "${_persist}" -eq 1 ] && iscsi::__persisted_lookup "${_target}" "${_portal}"; then
+        iscsi::__delete_stanza "${ISCSI_CONFIG_NICK}"
+    fi
+
+    echo "Removed iSCSI session ${_target} (${_portal})"
+}
+
+iscsi::attach(){
+    local _emulation _opt _guest _spec _target _lun _full
+    local _num=0 _disk _dev _curr _last_type _disk_type _gt _gl
+
+    OPTIND=1
+    while getopts t: _opt; do
+        case "${_opt}" in
+            t) _emulation="${OPTARG}" ;;
+            *) help::show "iscsi" ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+
+    _guest="$1"
+    _spec="$2"
+    [ -z "${_guest}" -o -z "${_spec}" ] && help::show "iscsi"
+    [ -n "$3" ] && util::err "too many arguments"
+
+    iscsi::__require
+    datastore::get_guest "${_guest}" || util::err "unable to locate virtual machine '${_guest}'"
+
+    if ! iscsi::__parse_spec "${_spec}" "_target" "_lun"; then
+        util::err "${ISCSI_ERROR}"
+    fi
+
+    if ! iscsi::__lookup "${_target}" ""; then
+        util::err "${ISCSI_ERROR}"
+    fi
+
+    if ! iscsi::__device_for "${ISCSI_TARGET}" "${_lun}"; then
+        util::err "${ISCSI_ERROR}"
+    fi
+
+    _full="${ISCSI_TARGET}/${_lun}"
+    config::load "${VM_DS_PATH}/${_guest}/${_guest}.conf"
+
+    while true; do
+        config::get "_disk" "disk${_num}_name"
+        [ -z "${_disk}" ] && break
+
+        config::get "_dev" "disk${_num}_dev" "file"
+        config::get "_disk_type" "disk${_num}_type"
+        [ -n "${_disk_type}" ] && _last_type="${_disk_type}"
+
+        if [ "${_dev}" = "iscsi" ] && iscsi::__parse_spec "${_disk}" "_gt" "_gl" >/dev/null 2>&1; then
+            if [ "${_gl}" -eq "${_lun}" ] && { [ "${_gt}" = "${ISCSI_TARGET}" ] || [ "${ISCSI_TARGET#*"${_gt}"}" != "${ISCSI_TARGET}" ]; }; then
+                util::err "virtual machine '${_guest}' already has iSCSI disk '${_full}'"
+            fi
+        fi
+
+        _num=$((_num + 1))
+    done
+
+    : ${_emulation:=${_last_type:-virtio-blk}}
+
+    config::set "${_guest}" "disk${_num}_name" "${_full}"
+    config::set "${_guest}" "disk${_num}_dev" "iscsi" "1"
+    config::set "${_guest}" "disk${_num}_type" "${_emulation}" "1"
+
+    echo "Attached iSCSI target ${_full} to ${_guest} as disk${_num} (${_emulation})"
+    if [ -e "/dev/vmm/${_guest}" ]; then
+        echo "The guest is running; restart it to use the new disk"
+    fi
+}
+
+iscsi::detach(){
+    local _force _opt _guest _spec _target _lun
+    local _conf _num=0 _index="" _max=-1 _disk _dev _gt _gl _found
+    local _key _keys _val _n _file _i
+
+    OPTIND=1
+    while getopts f _opt; do
+        case "${_opt}" in
+            f) _force="1" ;;
+            *) help::show "iscsi" ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+
+    _guest="$1"
+    _spec="$2"
+    [ -z "${_guest}" -o -z "${_spec}" ] && help::show "iscsi"
+    [ -n "$3" ] && util::err "too many arguments"
+
+    datastore::get_guest "${_guest}" || util::err "unable to locate virtual machine '${_guest}'"
+    _conf="${VM_DS_PATH}/${_guest}/${_guest}.conf"
+
+    if ! iscsi::__parse_spec "${_spec}" "_target" "_lun"; then
+        util::err "${ISCSI_ERROR}"
+    fi
+
+    config::load "${_conf}"
+
+    while true; do
+        config::get "_disk" "disk${_num}_name"
+        [ -z "${_disk}" ] && break
+
+        _max="${_num}"
+        config::get "_dev" "disk${_num}_dev" "file"
+
+        if [ "${_dev}" = "iscsi" ] && iscsi::__parse_spec "${_disk}" "_gt" "_gl" >/dev/null 2>&1; then
+            if [ "${_gl}" -eq "${_lun}" ] && { [ "${_gt}" = "${_target}" ] || [ "${_target#*"${_gt}"}" != "${_target}" ] || [ "${_gt#*"${_target}"}" != "${_gt}" ]; }; then
+                _found="${_found}${_found:+ }${_num}"
+            fi
+        fi
+
+        _num=$((_num + 1))
+    done
+
+    if [ -z "${_found}" ]; then
+        util::err "virtual machine '${_guest}' has no iSCSI disk '${_spec}'"
+    fi
+
+    case "${_found}" in
+        *' '*)
+            util::err "virtual machine '${_guest}' has multiple matching iSCSI disks: ${_found}"
+            ;;
+    esac
+
+    _index="${_found}"
+    if [ "${_index}" -eq 0 -a -z "${_force}" ]; then
+        util::err "refusing to detach boot disk0 from '${_guest}'; use -f"
+    fi
+
+    if [ -e "/dev/vmm/${_guest}" -a -z "${_force}" ]; then
+        util::err "virtual machine '${_guest}' is running; use -f to change its configuration"
+    fi
+
+    _keys=$(grep -E '^disk[0-9]+_' "${_conf}" | sed -E 's/^disk[0-9]+_//' | cut -d= -f1 | sort -u)
+
+    for _key in ${_keys}; do
+        config::remove "${_guest}" "disk${_index}_${_key}"
+    done
+
+    if [ "${_index}" -lt "${_max}" ]; then
+        for _key in ${_keys}; do
+            _n="${_max}"
+            while [ "${_n}" -gt "${_index}" ]; do
+                config::get "_val" "disk${_n}_${_key}"
+                if [ -n "${_val}" ]; then
+                    config::set "${_guest}" "disk$((_n - 1))_${_key}" "${_val}" "1"
+                fi
+                config::remove "${_guest}" "disk${_n}_${_key}"
+                _n=$((_n - 1))
+            done
+        done
+    fi
+
+    echo "Detached iSCSI disk '${_spec}' from ${_guest}"
+    if [ "${_index}" -eq 0 -a "${_max}" -gt 0 ]; then
+        echo "The guest boot disk is now the former disk1"
+    fi
+    if [ -e "/dev/vmm/${_guest}" ]; then
+        echo "The guest is running; restart it to apply the change"
+    fi
+}

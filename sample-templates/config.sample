@@ -184,8 +184,9 @@ disk0_type="virtio-blk"
 # For the zvol options, the zvol must be directly under the guest dataset.
 # There is also a 'custom' option, in which case the disk name should be the full path
 # to the file or device you want to use.
-# For 'iscsi', the disk name must be set to a unique target and lun combination
-# when matched against iscsictl -L output.
+# For 'iscsi', the disk name must be set to a target and lun combination.
+# The target must be connected when the guest starts. The 'vm iscsi attach'
+# command configures these values automatically.
 #
 # Default: file
 # Valid Options: file,zvol,sparse-zvol,custom,iscsi

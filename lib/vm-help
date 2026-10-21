@@ -90,6 +90,47 @@ Examples:
     vm datastore img imgplace /path/to/img/datastore
 "
 
+_hs_iscsi="
+Usage:
+    vm iscsi list [-v]
+    vm iscsi discover [-u <user> -s <secret>] [-r] [-e <on|off>] <portal>
+    vm iscsi add -n <nickname> [-c <config>] [-w <seconds>]
+    vm iscsi add -t <target> -p <portal> [-u <user> -s <secret>] [-r]
+                 [-e <on|off>] [-w <seconds>] [-g <guest>] [-N]
+    vm iscsi remove [-a] [-f] [-N] [<nickname>|<target>[/<lun>]]
+    vm iscsi attach [-t <emulation>] <guest> <target>[/<lun>]
+    vm iscsi detach [-f] <guest> <target>[/<lun>]
+
+Options:
+    -n <nickname>   Name of a session configured in /etc/iscsi.conf
+    -c <config>     Use an alternative iscsi.conf for -n
+    -t <target>     Target IQN (add/remove) or disk emulation (attach)
+    -p <portal>     Target portal address
+    -u <user>       CHAP username (requires -s)
+    -s <secret>     CHAP secret (requires -u)
+    -r              Use iSER instead of TCP
+    -e <on|off>     Enable or disable the session
+    -w <seconds>    Connection timeout (default 10, 0 disables)
+    -g <guest>      Attach the target to a guest as a new disk
+    -N              Do not save the target in vm-bhyve's iSCSI config
+    -a              Remove all sessions (remove only)
+    -f              Force removal of a session used by a guest (remove/detach)
+    -v              Show additional columns (list only)
+
+Examples:
+    vm iscsi discover 10.0.0.10
+    vm iscsi add -t iqn.2026-01.example:storage -p 10.0.0.10 -g web01
+    vm iscsi list -v
+    vm iscsi attach -t virtio-blk db01 iqn.2026-01.example:data/1
+    vm iscsi detach db01 iqn.2026-01.example:data/1
+
+Notes:
+    Sessions added with 'vm iscsi add' are stored in vm-bhyve's own
+    configuration (\$vm_dir/.config/iscsi.conf) and are reconnected
+    automatically when a guest using them is started. The system
+    /etc/iscsi.conf is never modified.
+"
+
 _hs_get_set="
 Usage:
     vm get <all|setting>

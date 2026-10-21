@@ -878,6 +878,12 @@ core::__start(){
         return 1
     fi
 
+    # make sure any iSCSI disks are connected before starting bhyve
+    if ! iscsi::ensure_guest_sessions "${_name}"; then
+        echo "  ! unable to prepare iSCSI disks for ${_name}"
+        return 1
+    fi
+
     # we can only load freebsd without unrestricted guest support
     if [ -n "${VM_NO_UG}" -a "${_loader}" != "bhyveload" ]; then
         echo "  ! no unrestricted guest support in cpu. only single vcpu FreeBSD guests supported"

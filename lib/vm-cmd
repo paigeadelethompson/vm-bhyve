@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-2-Clause
 # SPDX-FileCopyrightText: 2016 Matt Churchyard <churchers@gmail.com>
 
-CMD_VALID_LIST="init,switch,datastore,image,get,set,list,create,destroy,rename,install,start,stop,restart"
+CMD_VALID_LIST="init,switch,datastore,iscsi,image,get,set,list,create,destroy,rename,install,start,stop,restart"
 CMD_VALID_LIST="${CMD_VALID_LIST},add,reset,poweroff,startall,stopall,console,iso,img,configure,passthru,_run"
 CMD_VALID_LIST="${CMD_VALID_LIST},info,clone,snapshot,rollback,migrate,version,usage,edit"
 CMD_VALID_LIST="${CMD_VALID_LIST},suspend,suspendall,discard,help,tags"
@@ -54,6 +54,7 @@ cmd::parse(){
                    switch::init ;;
         switch)    cmd::parse_switch "$@" ;;
         datastore) cmd::parse_datastore "$@" ;;
+        iscsi)     cmd::parse_iscsi "$@" ;;
         image)     cmd::parse_image "$@" ;;
         get)       core::get "$@" ;;
         set)       core::set "$@" ;;
@@ -140,6 +141,31 @@ cmd::parse_switch(){
         tunnelfib) switch::tunnelfib "$@" ;;
         info)    info::switch "$@" ;;
         *)       util::err "unknown command '${_user_cmd}'. please run 'vm usage' or view the manpage for help" ;;
+    esac
+}
+
+# cmd: vm iscsi ...
+#
+# parse an iSCSI command
+#
+# @param string _cmd the command after 'vm iscsi ...'
+#
+cmd::parse_iscsi(){
+    local _cmd
+
+    [ -z "$1" ] && help::show "iscsi"
+
+    cmd::find "_cmd" "$1" "list,discover,add,remove,attach,detach" || help::show "iscsi"
+    shift
+
+    case "${_cmd}" in
+        list)     iscsi::list "$@" ;;
+        discover) iscsi::discover "$@" ;;
+        add)      iscsi::add "$@" ;;
+        remove)   iscsi::remove "$@" ;;
+        attach)   iscsi::attach "$@" ;;
+        detach)   iscsi::detach "$@" ;;
+        *)        util::err "unknown command '${_user_cmd}'. please run 'vm usage' or view the manpage for help" ;;
     esac
 }
 
