@@ -962,6 +962,168 @@ vm::bhyve_device_passthru(){
     fi
 }
 
+# find the device node for an attached iSCSI target
+# the target is already connected by the host initiator, so we only need
+# to resolve it to the current /dev/daN device. a target may optionally be
+# followed by /lun, which defaults to 0.
+#
+# @param string _var variable to put the device path into
+# @param string _spec target name, optionally followed by /lun
+#
+vm::find_iscsi(){
+    local _var="$1"
+    local _spec="$2"
+    local _target _full_target _lun _t_lun _list _matches _count _line
+    local _devices _device _state _verbose _sid _cam _cam_ok
+
+    [ -z "${_spec}" ] && util::err "iSCSI disk name is empty"
+
+    _target="${_spec}"
+    _lun=0
+
+    # split an optional trailing /lun from the target name
+    case "${_spec}" in
+        */*)
+            _t_lun="${_spec##*/}"
+            case "${_t_lun}" in
+                ''|*[!0-9]*) ;;
+                *) _lun="${_t_lun}" ; _target="${_spec%/*}" ;;
+            esac
+            ;;
+    esac
+
+    [ -z "${_target}" ] && util::err "invalid iSCSI target '${_spec}'"
+
+    command -v iscsictl >/dev/null 2>&1 || \
+        util::err "iscsictl is required for iSCSI disk '${_spec}'"
+
+    _list=$(iscsictl -L 2>/dev/null)
+    [ $? -eq 0 ] || util::err "unable to list iSCSI sessions for '${_spec}'"
+
+    # prefer an exact target match, otherwise allow a unique substring
+    _matches=$(printf '%s\n' "${_list}" | awk -v t="${_target}" '
+        !($1 == "Target" && $2 == "name") && $1 == t { print }')
+
+    if [ -z "${_matches}" ]; then
+        _matches=$(printf '%s\n' "${_list}" | awk -v t="${_target}" '
+            !($1 == "Target" && $2 == "name") && index($0, t) { print }')
+    fi
+
+    _count=$(printf '%s\n' "${_matches}" | awk 'NF { n++ } END { print n + 0 }')
+
+    if [ "${_count}" -eq 0 ]; then
+        util::err "unable to locate iSCSI target '${_target}' in iscsictl -L output"
+    elif [ "${_count}" -gt 1 ]; then
+        util::err "iSCSI target '${_target}' is ambiguous; matches ${_count} sessions"
+    fi
+
+    _line="${_matches}"
+    _full_target=$(printf '%s\n' "${_line}" | awk '{ print $1 }')
+
+    # extract the devices listed after 'Connected:' in the state column
+    _devices=$(printf '%s\n' "${_line}" | awk '
+        {
+            for (i = 3; i <= NF; i++) {
+                if ($i == "Connected:") {
+                    for (j = i + 1; j <= NF; j++) {
+                        printf "%s%s", (j > i + 1 ? " " : ""), $j
+                    }
+                    exit
+                }
+            }
+        }')
+
+    if [ -z "${_devices}" ]; then
+        _state=$(printf '%s\n' "${_line}" | awk '
+            { for (i = 3; i <= NF; i++) printf "%s%s", (i > 3 ? " " : ""), $i }')
+        util::err "iSCSI target '${_target}' is not connected (${_state})"
+    fi
+
+    # map the session and lun through CAM to get the exact device
+    _device=""
+    if command -v camcontrol >/dev/null 2>&1; then
+        _verbose=$(iscsictl -L -v 2>/dev/null)
+
+        if [ $? -eq 0 ]; then
+            _sid=$(printf '%s\n' "${_verbose}" | awk -v t="${_full_target}" '
+                /^Session ID:/ {
+                    sid = $0
+                    sub(/^Session ID:[[:space:]]*/, "", sid)
+                }
+                /^Target name:/ {
+                    name = $0
+                    sub(/^Target name:[[:space:]]*/, "", name)
+                    if (name == t) {
+                        print sid
+                        exit
+                    }
+                }')
+        fi
+
+        if [ -n "${_sid}" ]; then
+            _cam=$(camcontrol devlist -v 2>/dev/null)
+
+            if [ $? -eq 0 ]; then
+                _cam_ok=1
+                _device=$(printf '%s\n' "${_cam}" | awk -v sid="${_sid}" -v lun="${_lun}" '
+                    /^scbus[0-9]+ on iscsi[0-9]+ / {
+                        bus = $1
+                        sub(/:$/, "", bus)
+                        sess = $3
+                        sub(/^iscsi/, "", sess)
+                        if (sess == sid) {
+                            isbus[bus] = 1
+                        }
+                        next
+                    }
+                    / at scbus[0-9]+ / {
+                        line = $0
+                        sub(/^.* at /, "", line)
+                        split(line, f)
+                        if (!(f[1] in isbus)) {
+                            next
+                        }
+                        if (f[2] != "target" || f[4] != "lun" || f[5] != lun) {
+                            next
+                        }
+                        devs = f[6]
+                        gsub(/^\(/, "", devs)
+                        gsub(/\)$/, "", devs)
+                        split(devs, d, ",")
+                        for (i = 1; i in d; i++) {
+                            gsub(/^[[:space:]]+/, "", d[i])
+                            gsub(/[[:space:]]+$/, "", d[i])
+                            if (d[i] ~ /^da[0-9]+$/) {
+                                print d[i]
+                                exit
+                            }
+                        }
+                    }')
+            fi
+        fi
+    fi
+
+    # fall back to the only device if this is lun 0 and CAM was unavailable
+    if [ -z "${_device}" -a "${_lun}" -eq 0 -a -z "${_cam_ok}" ]; then
+        case "${_devices}" in
+            *' '*) ;;
+            *) _device="${_devices}" ;;
+        esac
+    fi
+
+    if [ -z "${_device}" ]; then
+        if [ "${_lun}" -ne 0 ] && ! command -v camcontrol >/dev/null 2>&1; then
+            util::err "camcontrol is required to resolve iSCSI lun ${_lun} for '${_target}'"
+        fi
+        util::err "unable to locate iSCSI device for '${_full_target}/${_lun}' (devices: ${_devices})"
+    fi
+
+    [ -c "/dev/${_device}" ] || \
+        util::err "iSCSI device /dev/${_device} for '${_full_target}/${_lun}' is not available"
+
+    setvar "${_var}" "/dev/${_device}"
+}
+
 # get the path to a disk image depending on type.
 # the disk name in configuration is usually the name of the file
 # or zvol, directly under the guest directory/dataset.
@@ -985,7 +1147,7 @@ vm::get_disk_path(){
         zvol)        ;&
         sparse-zvol) setvar "${_var}" "/dev/zvol/${VM_DS_ZFS_DATASET}/${_name}/${_disk}" ;;
         custom|9p)   setvar "${_var}" "${_disk}" ;;
-        iscsi)       info::__find_iscsi "${_var}" "${_disk}" ;;
+        iscsi)       vm::find_iscsi "${_var}" "${_disk}" ;;
         *)           setvar "${_var}" "${VM_DS_PATH}/${_name}/${_disk}" ;;
     esac
 }

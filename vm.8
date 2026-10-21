@@ -1672,11 +1672,21 @@ To use a disk image that is stored anywhere else, you can specify the full path
 in this option, and configure the device as
 .Sy custom .
 .Pp
-To use an established iscsi device, specify a target 'session[/lun]'
-(default /0) which matches a unique session from the
-.Pf ' Xr iscsictl 8
--L' command output, and configure the device as
+To use an iSCSI device that is already attached by the host initiator, specify
+the target name, optionally followed by
+.Pa /lun
+(default
+.Pa /0 ) ,
+which must match one unique session from the
+.Xr iscsictl 8
+.Fl L
+command output, and configure the device as
 .Sy iscsi .
+.Nm
+resolves the current
+.Pa /dev/daN
+device when the guest starts.
+It does not log in or out of iSCSI sessions or manage CHAP credentials.
 .It disk0_dev
 The type of device to use for the disk.
 If not specified, this will default to
@@ -1700,7 +1710,7 @@ the
 .Pa diskX_name
 parameter must be set to the full path to the image file or device.
 .Pp
-Already attached iscsi devices can have their device nodes dynamically
+Already attached iSCSI devices can have their device nodes dynamically
 detected and used by setting this option to
 .Sy iscsi
 and

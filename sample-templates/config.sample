@@ -184,8 +184,11 @@ disk0_type="virtio-blk"
 # For the zvol options, the zvol must be directly under the guest dataset.
 # There is also a 'custom' option, in which case the disk name should be the full path
 # to the file or device you want to use.
-# For 'iscsi', the disk name must be set to a unique target and lun combination
-# when matched against iscsictl -L output.
+# For 'iscsi', the target must already be attached by the host iSCSI initiator.
+# The disk name is the target name, optionally followed by /lun (default 0),
+# which must match one unique session from iscsictl -L output. vm-bhyve
+# resolves the current /dev/daN device when the guest starts, but does not log
+# in or out of iSCSI sessions or manage CHAP credentials.
 #
 # Default: file
 # Valid Options: file,zvol,sparse-zvol,custom,iscsi
